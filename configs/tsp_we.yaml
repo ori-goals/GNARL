@@ -1,0 +1,64 @@
+algorithm: tsp
+seed: 1
+expert_policy_kwargs:
+  method: greedy
+train_data:
+  graph_generator: coordinate
+  node_samples:
+    10: 10000
+    13: 10000
+    16: 10000
+    19: 10000
+    20: 10000
+  num_envs: 4
+  seed: 47
+  graph_dir: graph_data
+val_data:
+  graph_generator: coordinate
+  node_samples:
+    20: 100
+  deterministic: true
+  num_envs: 4
+  seed: 47
+  graph_dir: graph_data
+test_data:
+  graph_generator: coordinate
+  node_samples:
+    40: 1000
+    60: 32
+    80: 32
+    100: 32
+    200: 32
+    1000: 4
+  deterministic: true
+  num_envs: 4
+  seed: 47
+  graph_dir: graph_data
+policy_kwargs:
+  embed_dim: 64
+  pooling_type: max
+  network_kwargs:
+    aggr: max
+    num_gnn_layers: 4
+    num_mlp_layers: 2
+PPO:
+  n_steps: 1024
+  n_epochs: 10
+  gamma: 1
+  learning_rate: 0.0005
+  timesteps: 1000000
+  batch_size: 128
+  seed: 8
+  eval_freq: 1024
+BC:
+  n_episodes: 100000
+  n_epochs: 10
+  learning_rate: 0.0005
+  batch_size: 8
+  vf_coef: 0
+  gamma: 1
+  seed: 17
+  eval_freq: 100
+weights_init:
+  gnn_init: sparse
+  encoder_init: ibarz2022
