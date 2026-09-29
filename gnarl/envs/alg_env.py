@@ -323,7 +323,11 @@ class PhasedNodeSelectEnv(gym.Env, ABC):
         if self.graph_spec.get("adj", (None, None, None))[0] != "state":
             self.adj = th.sparse_coo_tensor(
                 self.graph_data.edge_index,
-                th.ones(self.graph_data.edge_index.size(1), dtype=th.bool),
+                th.ones(
+                    self.graph_data.edge_index.size(1),
+                    dtype=th.bool,
+                    device=self.graph_data.edge_index.device,
+                ),
                 (self.graph_data.num_nodes, self.graph_data.num_nodes),
             )
 

@@ -139,7 +139,13 @@ class GraphFeatureTransformer(BaseFeaturesExtractor):
         # Accumulate the encoded node features
         if node_features == {}:
             node_features = {
-                "node": th.zeros(batch_size, self.node_max, self.embed_dim)
+                "node": th.zeros(
+                    batch_size,
+                    self.node_max,
+                    self.embed_dim,
+                    device=adj_matrix.device,
+                    dtype=th.float32,
+                )
             }
         encoded_node_features = th.mean(
             th.stack(list(node_features.values()), dim=0), dim=0
@@ -152,6 +158,8 @@ class GraphFeatureTransformer(BaseFeaturesExtractor):
                     self.node_max,
                     self.node_max,
                     self.embed_dim,
+                    device=adj_matrix.device,
+                    dtype=th.float32,
                 )
             }
         encoded_edge_features = th.mean(
@@ -159,7 +167,14 @@ class GraphFeatureTransformer(BaseFeaturesExtractor):
         )
         # Accumulate the encoded graph features
         if graph_features == {}:
-            graph_features = {"graph": th.zeros(batch_size, self.embed_dim)}
+            graph_features = {
+                "graph": th.zeros(
+                    batch_size,
+                    self.embed_dim,
+                    device=adj_matrix.device,
+                    dtype=th.float32,
+                )
+            }
         encoded_graph_features = th.mean(
             th.stack(list(graph_features.values()), dim=0), dim=0
         )

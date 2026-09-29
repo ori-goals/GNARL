@@ -19,7 +19,8 @@ def sparse_init(module, sparsity_factor=0.9, **kwargs):
         rows, cols = module.weight.shape
         num_zeros = int(math.ceil(sparsity_factor * cols))
         for i in range(rows):
-            row_perm = th.randperm(cols)
+            # Advanced-index tensors must be on the indexed parameter's device.
+            row_perm = th.randperm(cols, device=module.weight.device)
             zero_indices = row_perm[:num_zeros]
             module.weight.data[i, zero_indices] = 0.0
         if hasattr(module, "bias") and module.bias is not None:

@@ -239,6 +239,8 @@ def train_bc(
         ),  # start, end, duration
         **config["policy_kwargs"],
     )
+    policy = policy.to(device)
+    print(f"Using device for behavioural cloning: {policy.device}")
     wandb.watch(policy, log="all", log_freq=100)
 
     per_env_samples = calculate_env_split(

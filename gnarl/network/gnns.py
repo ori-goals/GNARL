@@ -133,7 +133,10 @@ class MPNN(nng.MessagePassing):
     def forward(self, node_fts, edge_attr, graph_fts, edge_index, batch, **kwargs):
 
         graph_fts_padded = torch.zeros(
-            node_fts.shape[0], graph_fts.shape[1], device=edge_index.device
+            node_fts.shape[0],
+            graph_fts.shape[1],
+            device=node_fts.device,
+            dtype=graph_fts.dtype,
         )
         graph_fts_padded[: batch.shape[0]] = graph_fts[batch]
 

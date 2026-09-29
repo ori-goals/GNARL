@@ -418,6 +418,19 @@ class BatchIteratorWithEpochEndCallback:
         return batch_iterator()
 
 
+def _to_device(value, device):
+    """Move tensors in a nested batch, including observation dictionaries."""
+    if isinstance(value, th.Tensor):
+        return value.to(device)
+    if isinstance(value, dict):
+        return {key: _to_device(item, device) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return tuple(_to_device(item, device) for item in value)
+    if isinstance(value, list):
+        return [_to_device(item, device) for item in value]
+    return value
+
+
 def log_bc_epoch_stats(policy, data_loader, epoch, device="cpu"):
     """
     Computes and logs statistics for behavioural cloning at the end of an epoch.
@@ -439,7 +452,7 @@ def log_bc_epoch_stats(policy, data_loader, epoch, device="cpu"):
 
         with th.no_grad():
             for data in data_loader:
-                obs = data["obs"]
+                obs = _to_device(data["obs"], device)
                 acts = data["acts"].to(device)
                 dist = policy.get_distribution(obs)
                 logits = dist.distribution.logits
@@ -490,6 +503,9 @@ def compute_critic_loss(
     next_obs: dict[str, th.Tensor],
     values: th.Tensor,
 ):
+    next_obs = _to_device(next_obs, policy.device)
+    rewards = rewards.to(policy.device)
+    dones = dones.to(policy.device)
     k = policy.predict_values(next_obs)
     targets = rewards.unsqueeze(-1) + gamma * k * ~(dones.bool()).unsqueeze(-1)
     return F.mse_loss(values, targets)
@@ -620,12 +636,12 @@ def behavioural_cloning(
     for batch_idx, data in enumerate(batch_iterator):
         optimiser.zero_grad()
 
-        obs = data["obs"]
+        obs = _to_device(data["obs"], policy.device)
         if "act_probs" in data:
-            target = data["act_probs"]
+            target = data["act_probs"].to(policy.device)
             act_loss_fn = F.kl_div
         else:
-            target = data["acts"].squeeze(-1).squeeze(-1)
+            target = data["acts"].to(policy.device).squeeze(-1).squeeze(-1)
             act_loss_fn = F.cross_entropy
 
         if vf_coef != 0:
@@ -637,7 +653,7 @@ def behavioural_cloning(
         else:
             log_probs = get_log_probs(policy, obs)
             actor_loss = compute_actor_loss(log_probs, target, act_loss_fn)
-            critic_loss = th.tensor(0.0)
+            critic_loss = th.zeros((), device=policy.device)
 
         loss = actor_loss + vf_coef * critic_loss
         loss.backward()
