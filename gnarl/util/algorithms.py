@@ -427,65 +427,6 @@ def reroot_tree(pred: np.ndarray, v: int) -> np.ndarray:
     return new_pred
 
 
-def mst_kruskal(A: np.ndarray) -> tuple[np.ndarray, int]:
-    """Kruskal's minimum spanning tree (Kruskal, 1956)."""
-
-    pi = np.arange(A.shape[0])
-    num_steps = 0
-
-    def mst_union(u, v, in_mst):
-        root_u = u
-        root_v = v
-        mask_u = np.zeros(in_mst.shape[0])
-        mask_v = np.zeros(in_mst.shape[0])
-        mask_u[u] = 1
-        mask_v[v] = 1
-
-        while pi[root_u] != root_u:
-            root_u = pi[root_u]
-            for i in range(mask_u.shape[0]):
-                if mask_u[i] == 1:
-                    pi[i] = root_u
-            mask_u[root_u] = 1
-
-        while pi[root_v] != root_v:
-            root_v = pi[root_v]
-            for i in range(mask_v.shape[0]):
-                if mask_v[i] == 1:
-                    pi[i] = root_v
-            mask_v[root_v] = 1
-
-        if root_u < root_v:
-            in_mst[u, v] = 1
-            in_mst[v, u] = 1
-            pi[root_u] = root_v
-        elif root_u > root_v:
-            in_mst[u, v] = 1
-            in_mst[v, u] = 1
-            pi[root_v] = root_u
-
-    in_mst = np.zeros((A.shape[0], A.shape[0]))
-
-    # Prep to sort edge array
-    lx = []
-    ly = []
-    wts = []
-    for i in range(A.shape[0]):
-        for j in range(i + 1, A.shape[0]):
-            if A[i, j] > 0:
-                lx.append(i)
-                ly.append(j)
-                wts.append(A[i, j])
-
-    for ind in np.argsort(wts):
-        u = lx[ind]
-        v = ly[ind]
-        mst_union(u, v, in_mst)
-        num_steps += 1
-
-    return in_mst, num_steps
-
-
 def _verify_spanning_tree_properties_and_weight(
     edge_set: set, n_nodes: int, A: np.ndarray, adj: np.ndarray
 ) -> float | None:

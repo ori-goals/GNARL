@@ -1,8 +1,8 @@
 from gymnasium.envs.registration import register
 
 register(
-    id="BellmanFord-v2",
-    entry_point="gnarl.envs.clrs_envs:BellmanFordEnvV2",
+    id="BellmanFord-v1",
+    entry_point="gnarl.envs.clrs_envs:BellmanFordEnv",
     nondeterministic=False,
 )
 
@@ -25,12 +25,6 @@ register(
 )
 
 register(
-    id="MSTKruskal-v1",
-    entry_point="gnarl.envs.clrs_envs:MSTKruskalEnv",
-    nondeterministic=False,
-)
-
-register(
     id="TSP-v1",
     entry_point="gnarl.envs.np_envs:TSPEnv",
     nondeterministic=False,
@@ -43,18 +37,17 @@ register(
 )
 
 register(
-    id="RobustConstruction-v1",
-    entry_point="gnarl.envs.np_envs:RobustConstructionEnv",
+    id="RGC-v1",
+    entry_point="gnarl.envs.np_envs:RGCEnv",
     nondeterministic=True,
 )
 
 ENV_MAPPING = {
     "bfs": "BFS-v1",
-    "bellman_ford": "BellmanFord-v2",
+    "bellman_ford": "BellmanFord-v1",
     "dfs": "DFS-v1",
     "mst_prim": "MSTPrim-v1",
-    "mst_kruskal": "MSTKruskal-v1",
     "tsp": "TSP-v1",
     "mvc": "MVC-v1",
-    "robust_construction": "RobustConstruction-v1",
+    "rgc": "RGC-v1",
 }

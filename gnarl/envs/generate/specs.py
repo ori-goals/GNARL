@@ -14,7 +14,7 @@ SPECS.update(
             "adj": (Stage.INPUT, Location.EDGE, Type.MASK),
             "nw": (Stage.INPUT, Location.NODE, Type.SCALAR),  # node weights
         },
-        "robust_construction": {
+        "rgc": {
             "initial_edges": (Stage.INPUT, Location.EDGE, Type.MASK),
             "tau": (Stage.INPUT, Location.GRAPH, Type.SCALAR),
         },

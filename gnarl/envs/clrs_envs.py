@@ -12,12 +12,8 @@ from gnarl.util.algorithms import (
     all_nodes_to_source,
     bellman_ford,
     mst_prim,
-    mst_kruskal,
     check_valid_mst_predecessors,
-    check_valid_mst_mask,
     check_valid_dfs_solution,
-    find_root,
-    reroot_tree,
 )
 from gnarl.util.graph_data import GraphProblemData
 from torch_geometric.utils import to_dense_adj
@@ -32,6 +28,7 @@ class BFSEnv(PhasedNodeSelectEnv):
         self,
         max_nodes: int,
         graph_generator: GraphGenerator,
+        reward: str | None = None,
         **kwargs,
     ):
         super().__init__(
@@ -39,6 +36,7 @@ class BFSEnv(PhasedNodeSelectEnv):
             num_phases=2,
             graph_generator=graph_generator,
         )
+        self.reward_type = reward
 
     def _init_observation_space(
         self,
@@ -121,6 +119,21 @@ class BFSEnv(PhasedNodeSelectEnv):
     def is_terminal(self) -> bool:
         return self.is_success()
 
+    def _get_reward(self, **kwargs) -> float:
+        if self.reward_type == "terminal":
+            return 1.0 if self.is_success() else 0.0
+        elif self.reward_type == "matches":
+            current_depths = create_depth_counter(self.reach, self.predecessors)
+            matches = sum(
+                1
+                for c, s in zip(current_depths, self.solution_depths)
+                if abs(c - s) < 1e-4
+            )
+            rw = matches - self.previous_obj
+            self.previous_obj = matches
+            return rw / len(current_depths)
+        return 0.0
+
     def _step_env(self, action: int) -> dict:
         if self.current_phase != 1:
             return {}
@@ -138,30 +151,23 @@ class BFSEnv(PhasedNodeSelectEnv):
 
     def action_masks(self):
         if self.current_phase == 0:
+            # All nodes are selectable in phase 0
             return pad_to_max_nodes(
                 np.ones((self.graph_data.num_nodes,)), self.max_nodes
             )
         elif self.current_phase == 1:
+            # Only neighbours of the last selected node are selectable in phase 1
             return pad_to_max_nodes(
                 self.adj[self.last_selected[0]].to_dense().numpy(),
                 self.max_nodes,
             )
         raise ValueError("Invalid phase for action masks.")
 
-    def render(self, mode="human"):
-        print("Reach:")
-        print(self.reach)
-        print("Predecessors:")
-        print(self.predecessors)
-
     @staticmethod
-    def expert_policy(obs: dict[str, np.ndarray], *args, **kwargs) -> np.ndarray:
-
-        to_unnest = False
-        if len(obs["last_selected_0"].shape) < 2:
-            to_unnest = True
-        for key, value in obs.items():
-            value = np.expand_dims(value, axis=0)
+    def _expert_policy_probabilities(
+        obs: dict[str, np.ndarray], i, *args, **kwargs
+    ) -> np.ndarray:
+        raise_invalid = kwargs.get("raise_invalid", True)
 
         def check_closed(mask, adj):
             closed = np.zeros((len(mask),), dtype=bool)
@@ -217,29 +223,60 @@ class BFSEnv(PhasedNodeSelectEnv):
             )  # equal probabilities
             return node_probs
 
-        def single_policy(o, i):
-            if o["phase"][i] == 0:  # phase 1
-                return phase_1_policy(o, i)
+        if obs["phase"][i] == 0:  # phase 1
+            return phase_1_policy(obs, i)
 
-            elif o["phase"][i] == 1:  # phase 2
-                neighbour = phase_2_policy(o, i, np.argmax(o["last_selected_0"][i]))
-                if neighbour is not None and neighbour.sum() > 0:
-                    return neighbour
-                else:
-                    raise ValueError("No valid neighbours found for phase 2.")
-
+        elif obs["phase"][i] == 1:  # phase 2
+            neighbour = phase_2_policy(obs, i, np.argmax(obs["last_selected_0"][i]))
+            if neighbour is not None and neighbour.sum() > 0:
+                return neighbour
             else:
+                if raise_invalid:
+                    raise ValueError("No valid neighbours found for phase 2.")
+                else:
+                    usable_nodes = (obs["adj"][i].sum(0) > 0) * 1.0
+                    return usable_nodes / usable_nodes.sum()
+
+        else:
+            if raise_invalid:
                 raise ValueError("Invalid phase for action selection.")
+            else:
+                usable_nodes = (obs["adj"][i].sum(0) > 0) * 1.0
+                return usable_nodes / usable_nodes.sum()
+
+    @staticmethod
+    def _expert_policy_demonstrations(
+        obs: dict[str, np.ndarray], i: int, **kwargs
+    ) -> np.ndarray:
+        probs = BFSEnv._expert_policy_probabilities(obs, i, **kwargs)
+        return np.array([np.random.choice(len(probs), p=probs)])
+
+    @staticmethod
+    def expert_policy(obs: dict[str, np.ndarray], *args, **kwargs) -> np.ndarray:
+        """Expert policy for the BFS environment.
+
+        Returns action demonstrations rather than probabilities.
+        """
+
+        def single_policy(o, i):
+            method = kwargs.get("method", "probabilities")
+            if method == "probabilities":
+                return BFSEnv._expert_policy_probabilities(o, i, **kwargs)
+            elif method == "demonstrations":
+                return BFSEnv._expert_policy_demonstrations(o, i, **kwargs)
 
         actions = np.array(
             [single_policy(obs, i) for i in range(len(obs["last_selected_0"]))]
         )
-        if to_unnest:
-            return actions.reshape(-1, len(actions[0]))
+
         return actions
 
 
 class DFSEnv(BFSEnv):
+    """
+    Adapts the BFS environment to simulate the DFS algorithm.
+    Only changes the conditions for a terminal/successful state.
+    """
 
     def is_success(self) -> bool | None:
         state = (
@@ -267,12 +304,7 @@ class DFSEnv(BFSEnv):
 
     @staticmethod
     def expert_policy(obs: dict[str, np.ndarray], *args, **kwargs) -> np.ndarray:
-
-        to_unnest = False
-        if len(obs["last_selected_0"].shape) < 2:
-            to_unnest = True
-        for key, value in obs.items():
-            value = np.expand_dims(value, axis=0)
+        raise_invalid = kwargs.get("raise_invalid", True)
 
         def get_node_colour(mask, adj):
             colour = mask.copy()  # 0=white, 1=grey, 2=black
@@ -316,7 +348,11 @@ class DFSEnv(BFSEnv):
             depth_counter = create_depth_counter(colour != 0, o["predecessors_ptr"][i])
 
             if np.all(colour == 2):
-                raise ValueError("No open nodes found for phase 1.")
+                if raise_invalid:
+                    raise ValueError("No open nodes found for phase 1.")
+                else:
+                    usable_nodes = (o["adj"][i].sum(0) > 0) * 1.0
+                    return usable_nodes / usable_nodes.sum()
 
             # Get the maximum depth of an open node
             maximum_depth = np.max(depth_counter[colour != 2])
@@ -331,9 +367,13 @@ class DFSEnv(BFSEnv):
                     (colour == 0) & (depth_counter == maximum_depth)
                 )[0]
                 if len(eligible_nodes) == 0:
-                    raise ValueError(
-                        "No eligible nodes found for depth counter calculation."
-                    )
+                    if raise_invalid:
+                        raise ValueError(
+                            "No eligible nodes found for depth counter calculation."
+                        )
+                    else:
+                        usable_nodes = (o["adj"][i].sum(0) > 0) * 1.0
+                        return usable_nodes / usable_nodes.sum()
 
             # Return the eligible nodes with equal probabilities
             node_probs = np.zeros((len(colour),), dtype=np.float32)
@@ -351,20 +391,26 @@ class DFSEnv(BFSEnv):
                 if neighbour is not None and neighbour.sum() > 0:
                     return neighbour
                 else:
-                    raise ValueError("No valid neighbours found for phase 2.")
+                    if raise_invalid:
+                        raise ValueError("No valid neighbours found for phase 2.")
+                    else:
+                        usable_nodes = (o["adj"][i].sum(0) > 0) * 1.0
+                        return usable_nodes / usable_nodes.sum()
 
             else:
-                raise ValueError("Invalid phase for action selection.")
+                if raise_invalid:
+                    raise ValueError("Invalid phase for action selection.")
+                else:
+                    usable_nodes = (o["adj"][i].sum(0) > 0) * 1.0
+                    return usable_nodes / usable_nodes.sum()
 
         actions = np.array(
             [single_policy(obs, i) for i in range(len(obs["last_selected_0"]))]
         )
-        if to_unnest:
-            return actions.reshape(-1, len(actions[0]))
         return actions
 
 
-class BellmanFordEnvV2(PhasedNodeSelectEnv):
+class BellmanFordEnv(PhasedNodeSelectEnv):
     """
     A custom Gymnasium environment for simulating the Bellman-Ford algorithm.
     """
@@ -373,11 +419,13 @@ class BellmanFordEnvV2(PhasedNodeSelectEnv):
         self,
         max_nodes: int,
         graph_generator: GraphGenerator,
+        reward: str | None = "step",
         **kwargs,
     ):
         super().__init__(
             max_nodes=max_nodes, num_phases=2, graph_generator=graph_generator
         )
+        self.reward_type = reward
 
     def _init_observation_space(
         self,
@@ -442,6 +490,14 @@ class BellmanFordEnvV2(PhasedNodeSelectEnv):
 
         self._is_success_inputs = None
 
+        if self.reward_type == "gap_to_optimal":
+            current_costs = all_nodes_to_source(
+                self.predecessors, self.graph_data.s, self.adj, self.weights
+            )
+            self.previous_obj = sum(
+                c - s for c, s in zip(current_costs, self.solution_distances)
+            )
+
         return {}
 
     @staticmethod
@@ -451,7 +507,8 @@ class BellmanFordEnvV2(PhasedNodeSelectEnv):
     @property
     def max_episode_steps(self) -> int:
         if hasattr(self.graph_data, "expert_objective"):
-            # 200% of expert policy length
+            # 200% of expert policy length. Technically can prevent the agent from solving
+            # the problem, but significantly shortens evaluation time.
             return 2 * self.num_phases * -self.graph_data.expert_objective.item()
         return self.get_max_episode_steps(
             self.graph_data.num_nodes, self.graph_data.num_edges
@@ -497,23 +554,43 @@ class BellmanFordEnvV2(PhasedNodeSelectEnv):
 
         return {}
 
-    def get_reward(self, **kwargs) -> float:
-        return -1  # override to track the number of steps taken, not used in training
+    def _get_reward(self, **kwargs) -> float:
+        if self.reward_type == "terminal":
+            return 1.0 if self.is_success() else 0.0
+        elif self.reward_type == "step":
+            return -1
+        elif self.reward_type == "matches":
+            current_costs = all_nodes_to_source(
+                self.predecessors, self.graph_data.s, self.adj, self.weights
+            )
+            matches = sum(
+                1
+                for c, s in zip(current_costs, self.solution_distances)
+                if abs(c - s) < 1e-4
+            )
+            rw = matches - self.previous_obj
+            self.previous_obj = matches
+            return rw / len(current_costs)
+        elif self.reward_type == "gap_to_optimal":
+            current_costs = all_nodes_to_source(
+                self.predecessors, self.graph_data.s, self.adj, self.weights
+            )
+            gap = sum(c - s for c, s in zip(current_costs, self.solution_distances))
+            rw = self.previous_obj - gap
+            self.previous_obj = gap
+            return rw / len(current_costs)
+        return 0.0
 
     def action_masks(self):
         if self.current_phase == 0:
+            # Nodes in the mask are selectable in phase 0
             return pad_to_max_nodes(self.msk, self.max_nodes)
         elif self.current_phase == 1:
+            # Only neighbours of the last selected node are selectable in phase 1
             edges = self.adj[self.last_selected[0]].to_dense().numpy().copy()
             edges[self.last_selected[0]] = 0
             return pad_to_max_nodes(edges, self.max_nodes)
         raise ValueError("Invalid phase for action masks.")
-
-    def render(self, mode="human"):
-        print("Distances:")
-        print(self.distances)
-        print("Predecessors:")
-        print(self.predecessors)
 
     @staticmethod
     def pre_transform(data: GraphProblemData) -> GraphProblemData:
@@ -526,7 +603,11 @@ class BellmanFordEnvV2(PhasedNodeSelectEnv):
         return data
 
     @staticmethod
-    def _expert_policy_probabilities(obs: dict[str, np.ndarray], i: int) -> np.ndarray:
+    def _expert_policy_probabilities(
+        obs: dict[str, np.ndarray], i: int, **kwargs
+    ) -> np.ndarray:
+        raise_invalid = kwargs.get("raise_invalid", True)
+
         def generate_start_indices(mask, start_at):
             active_indices = np.where(mask == 1)[0]
             start_index = np.argmax(start_at)
@@ -573,9 +654,13 @@ class BellmanFordEnvV2(PhasedNodeSelectEnv):
 
                 possible_nodes.append(sel_node)
             if not possible_nodes:
-                raise ValueError(
-                    "No valid node found for phase 1. Check the input data."
-                )
+                if raise_invalid:
+                    raise ValueError(
+                        "No valid node found for phase 1. Check the input data."
+                    )
+                else:
+                    usable_nodes = (o["adj"][i].sum(0) > 0) * 1.0
+                    return usable_nodes / usable_nodes.sum()
             possible_nodes = list(set(possible_nodes))  # remove duplicates
             node_probs = np.zeros((len(o["mask"][i]),), dtype=np.float32)
             for node in possible_nodes:
@@ -597,14 +682,24 @@ class BellmanFordEnvV2(PhasedNodeSelectEnv):
             if neighbour is not None and neighbour.sum() > 0:
                 return neighbour
             else:
-                raise ValueError("No valid neighbours found for phase 2.")
+                if raise_invalid:
+                    raise ValueError("No valid neighbours found for phase 2.")
+                else:
+                    usable_nodes = (obs["adj"][i].sum(0) > 0) * 1.0
+                    return usable_nodes / usable_nodes.sum()
 
         else:
-            raise ValueError("Invalid phase for action selection.")
+            if raise_invalid:
+                raise ValueError("Invalid phase for action selection.")
+            else:
+                usable_nodes = (obs["adj"][i].sum(0) > 0) * 1.0
+                return usable_nodes / usable_nodes.sum()
 
     @staticmethod
-    def _expert_policy_demonstrations(obs: dict[str, np.ndarray], i: int) -> np.ndarray:
-        probs = BellmanFordEnvV2._expert_policy_probabilities(obs, i)
+    def _expert_policy_demonstrations(
+        obs: dict[str, np.ndarray], i: int, **kwargs
+    ) -> np.ndarray:
+        probs = BellmanFordEnv._expert_policy_probabilities(obs, i, **kwargs)
         return np.array([np.random.choice(len(probs), p=probs)])
 
     @staticmethod
@@ -614,24 +709,16 @@ class BellmanFordEnvV2(PhasedNodeSelectEnv):
         Returns action demonstrations rather than probabilities.
         """
 
-        to_unnest = False
-        if len(obs["last_selected_0"].shape) < 2:
-            to_unnest = True
-        for key, value in obs.items():
-            value = np.expand_dims(value, axis=0)
-
         def single_policy(o, i):
             method = kwargs.get("method", "probabilities")
             if method == "probabilities":
-                return BellmanFordEnvV2._expert_policy_probabilities(o, i)
+                return BellmanFordEnv._expert_policy_probabilities(o, i, **kwargs)
             elif method == "demonstrations":
-                return BellmanFordEnvV2._expert_policy_demonstrations(o, i)
+                return BellmanFordEnv._expert_policy_demonstrations(o, i, **kwargs)
 
         actions = np.array(
             [single_policy(obs, i) for i in range(len(obs["last_selected_0"]))]
         )
-        if to_unnest:
-            return actions.reshape(-1, len(actions[0]))
 
         return actions
 
@@ -641,11 +728,13 @@ class MSTPrimEnv(PhasedNodeSelectEnv):
         self,
         max_nodes: int,
         graph_generator: GraphGenerator,
+        reward: str | None = "step",
         **kwargs,
     ):
         super().__init__(
             max_nodes=max_nodes, num_phases=2, graph_generator=graph_generator
         )
+        self.reward_type = reward
 
     def _init_observation_space(
         self,
@@ -752,6 +841,13 @@ class MSTPrimEnv(PhasedNodeSelectEnv):
     def is_terminal(self) -> bool:
         return self.is_success() == True
 
+    def _get_reward(self, **kwargs) -> float:
+        if self.reward_type == "terminal":
+            return 1.0 if self.is_success() else 0.0
+        elif self.reward_type == "step":
+            return -1
+        return 0.0
+
     def _step_env(self, action: int) -> dict:
         if self.current_phase != 1:
             self.mark[action] = 1
@@ -773,25 +869,17 @@ class MSTPrimEnv(PhasedNodeSelectEnv):
 
     def action_masks(self):
         if self.current_phase == 0:
+            # Nodes in the in_queue are selectable in phase 0
             possible_nodes = self.in_queue.copy()
             if self.last_selected[0] is not None:
                 possible_nodes[self.last_selected[0]] = 1
             return pad_to_max_nodes(possible_nodes, self.max_nodes)
         elif self.current_phase == 1:
+            # Only neighbours of the last selected node are selectable in phase 1
             edges = self.adj[self.last_selected[0]].to_dense().numpy().copy()
             edges[self.last_selected[0]] = 0
             return pad_to_max_nodes(edges, self.max_nodes)
         raise ValueError("Invalid phase for action masks.")
-
-    def render(self, mode="human"):
-        print("Key:")
-        print(self.key)
-        print("Predecessors:")
-        print(self.predecessors)
-        print("Mark:")
-        print(self.mark)
-        print("In Queue:")
-        print(self.in_queue)
 
     @staticmethod
     def pre_transform(data: GraphProblemData) -> GraphProblemData:
@@ -806,7 +894,11 @@ class MSTPrimEnv(PhasedNodeSelectEnv):
         return data
 
     @staticmethod
-    def _expert_policy_probabilities(obs: dict[str, np.ndarray], i: int) -> np.ndarray:
+    def _expert_policy_probabilities(
+        obs: dict[str, np.ndarray], i: int, **kwargs
+    ) -> np.ndarray:
+        raise_invalid = kwargs.get("raise_invalid", True)
+
         def phase_2_policy(o, i, sel_node, max_nodes):
             neighbours = np.where(o["adj"][i][sel_node][:max_nodes] == 1)[0]
             neighbours = neighbours[neighbours != sel_node]
@@ -842,7 +934,13 @@ class MSTPrimEnv(PhasedNodeSelectEnv):
                 node_probs[node] = 1.0
                 return node_probs
 
-            raise ValueError("No valid node found for phase 1. Check the input data.")
+            if raise_invalid:
+                raise ValueError(
+                    "No valid node found for phase 1. Check the input data."
+                )
+            else:
+                usable_nodes = (o["adj"][i].sum(0) > 0) * 1.0
+                return usable_nodes / usable_nodes.sum()
 
         max_nodes = unpad_array(obs["adj"][i]).shape[0]
         if obs["phase"][i] == 0:  # phase 1
@@ -855,14 +953,24 @@ class MSTPrimEnv(PhasedNodeSelectEnv):
             if neighbour is not None and neighbour.sum() > 0:
                 return neighbour
             else:
-                raise ValueError("No valid neighbours found for phase 2.")
+                if raise_invalid:
+                    raise ValueError("No valid neighbours found for phase 2.")
+                else:
+                    usable_nodes = (obs["adj"][i].sum(0) > 0) * 1.0
+                    return usable_nodes / usable_nodes.sum()
 
         else:
-            raise ValueError("Invalid phase for action selection.")
+            if raise_invalid:
+                raise ValueError("Invalid phase for action selection.")
+            else:
+                usable_nodes = (obs["adj"][i].sum(0) > 0) * 1.0
+                return usable_nodes / usable_nodes.sum()
 
     @staticmethod
-    def _expert_policy_demonstrations(obs: dict[str, np.ndarray], i: int) -> np.ndarray:
-        probs = MSTPrimEnv._expert_policy_probabilities(obs, i)
+    def _expert_policy_demonstrations(
+        obs: dict[str, np.ndarray], i: int, **kwargs
+    ) -> np.ndarray:
+        probs = MSTPrimEnv._expert_policy_probabilities(obs, i, **kwargs)
         return np.array([np.random.choice(len(probs), p=probs)])
 
     @staticmethod
@@ -872,273 +980,15 @@ class MSTPrimEnv(PhasedNodeSelectEnv):
         Returns action demonstrations rather than probabilities.
         """
 
-        to_unnest = False
-        if len(obs["last_selected_0"].shape) < 2:
-            to_unnest = True
-        for key, value in obs.items():
-            value = np.expand_dims(value, axis=0)
-
         def single_policy(o, i):
             method = kwargs.get("method", "probabilities")
             if method == "probabilities":
-                return MSTPrimEnv._expert_policy_probabilities(o, i)
+                return MSTPrimEnv._expert_policy_probabilities(o, i, **kwargs)
             elif method == "demonstrations":
-                return MSTPrimEnv._expert_policy_demonstrations(o, i)
+                return MSTPrimEnv._expert_policy_demonstrations(o, i, **kwargs)
 
         actions = np.array(
             [single_policy(obs, i) for i in range(len(obs["last_selected_0"]))]
         )
-        if to_unnest:
-            return actions.reshape(-1, len(actions[0]))
-
-        return actions
-
-
-class MSTKruskalEnv(PhasedNodeSelectEnv):
-    def __init__(
-        self,
-        max_nodes: int,
-        graph_generator: GraphGenerator,
-        **kwargs,
-    ):
-        super().__init__(
-            max_nodes=max_nodes, num_phases=2, graph_generator=graph_generator
-        )
-
-    def _init_observation_space(
-        self,
-    ) -> tuple[gym.spaces.Dict, dict[str, tuple[str, str, str]]]:
-        obs_space = spaces.Dict(
-            {  # outputs
-                "in_mst": spaces.Box(
-                    low=0,
-                    high=1,
-                    shape=(self.max_nodes, self.max_nodes),
-                    dtype=np.int32,
-                ),
-                # state
-                "predecessor": spaces.Box(
-                    low=0,
-                    high=self.max_nodes - 1,
-                    shape=(self.max_nodes,),
-                    dtype=np.int32,
-                ),
-            }
-        )
-        spec = {
-            "in_mst": ("state", "edge", "mask"),
-            "predecessor": ("state", "node", "pointer"),
-        }
-        return obs_space, spec
-
-    def _get_observation(self) -> dict:
-        return {
-            "in_mst": pad_to_max_nodes(self.in_mst, self.max_nodes),
-            "predecessor": pad_to_max_nodes(self.predecessor, self.max_nodes),
-        }
-
-    def _reset_state(self, seed=None, options=None):
-        # Initialise state variables
-        self.in_mst = np.zeros(
-            (self.graph_data.num_nodes, self.graph_data.num_nodes), dtype=np.int32
-        )
-        self.predecessor = np.arange(self.graph_data.num_nodes, dtype=np.int32)
-
-        self.weights = to_dense_adj(
-            self.graph_data.edge_index, edge_attr=self.graph_data.A
-        )[0]
-
-        if hasattr(self.graph_data, "in_mst"):
-            self.solution_edges = to_dense_adj(
-                self.graph_data.edge_index, edge_attr=self.graph_data.in_mst
-            )[0].numpy()
-        else:
-            self.solution_edges, _ = mst_kruskal(
-                self.weights[
-                    : self.graph_data.num_nodes, : self.graph_data.num_nodes
-                ].numpy()
-            )
-
-        # For caching
-        self._is_success_inputs = None
-
-        return {}
-
-    @staticmethod
-    def get_max_episode_steps(n: int, e: int) -> int:
-        return 2 * e  # Worst-case complexity
-
-    def is_success(self) -> bool | None:
-        state = (
-            tuple(self.in_mst.flatten().tolist()),
-            tuple(self.predecessor.tolist()),
-        )
-        if self._is_success_inputs == state:
-            return self._is_success_cache
-
-        # Compute success criterion
-        result = check_valid_mst_mask(
-            self.solution_edges[
-                : self.graph_data.num_nodes, : self.graph_data.num_nodes
-            ],
-            self.in_mst,
-            self.adj.to_dense().numpy(),
-            self.weights.numpy(),
-        )
-
-        # Cache
-        self._is_success_inputs = state
-        self._is_success_cache = result
-        return result
-
-    def is_terminal(self) -> bool:
-        return self.is_success() == True
-
-    def _step_env(self, action: int) -> dict:
-        if self.current_phase != 1:
-            return {}
-
-        u = self.last_selected[0]
-        v = action
-
-        # Add the edge to the MST
-        root_u = find_root(self.predecessor, u)
-        root_v = find_root(self.predecessor, v)
-        if root_u != root_v:
-            self.in_mst[u, v] = 1
-            self.in_mst[v, u] = 1
-            # reroot the tree so that all predecessor edges are in the graph
-            self.predecessor = reroot_tree(self.predecessor, v)
-            self.predecessor[v] = u
-
-        return {}
-
-    def action_masks(self):
-        available_edges = self.adj.to_dense().numpy().copy() - self.in_mst
-        if self.current_phase == 0:
-            node_mask = (available_edges.sum(axis=1) > 0).astype(np.int32)
-            return pad_to_max_nodes(node_mask, self.max_nodes)
-        elif self.current_phase == 1:
-            edges = available_edges[self.last_selected[0]]
-            edges[self.last_selected[0]] = 0
-            return pad_to_max_nodes(edges, self.max_nodes)
-        raise ValueError("Invalid phase for action masks.")
-
-    def render(self, mode="human"):
-        print("In MST:")
-        print(self.in_mst)
-        print("Predecessors (predecessor):")
-        print(self.predecessor)
-
-    @staticmethod
-    def pre_transform(data: GraphProblemData) -> GraphProblemData:
-        """Add the expert policy value to the data."""
-        in_mst, num_steps = mst_kruskal(
-            to_dense_adj(data.edge_index, edge_attr=data.A)[0].numpy()
-        )
-        obj = -num_steps
-        data.expert_objective = th.tensor(obj, dtype=th.float32)
-        data.in_mst = th.tensor(in_mst[data.edge_index[0], data.edge_index[1]])
-        return data
-
-    @staticmethod
-    def _expert_policy_probabilities(obs: dict[str, np.ndarray], i: int) -> np.ndarray:
-        def is_disjoint(u, v, o, i):
-            root_u = find_root(o["predecessor"][i], u)
-            root_v = find_root(o["predecessor"][i], v)
-            return root_u != root_v
-
-        def phase_2_policy(o, i, sel_node, max_nodes):
-            available_edges = (
-                o["adj"][i][sel_node][:max_nodes] - o["in_mst"][i][sel_node][:max_nodes]
-            )
-            neighbours = np.where(available_edges == 1)[0]
-            neighbours = neighbours[neighbours != sel_node]
-            if len(neighbours) == 0:
-                return None
-            disjoint_neighbours = np.array(
-                [n for n in neighbours if is_disjoint(sel_node, n, o, i)]
-            )
-            if len(disjoint_neighbours) == 0:
-                return None
-
-            neighbour_distances = o["A"][i][sel_node][disjoint_neighbours]
-            usable = neighbour_distances == neighbour_distances.min()
-            if sum(usable) == 0:
-                return None
-            node_probs = np.zeros((len(o["last_selected_0"][i]),), dtype=np.float32)
-            node_probs[disjoint_neighbours[usable]] = 1.0 / sum(usable)
-            return node_probs
-
-        def phase_1_policy(o, i, max_nodes):
-            available_edges = o["adj"][i][:max_nodes] - o["in_mst"][i][:max_nodes]
-            edge_index = np.array(np.where(available_edges == 1))
-
-            if len(edge_index[0]) == 0:
-                raise ValueError("No valid edges found for phase 1.")
-
-            edge_weights = o["A"][i][edge_index[0], edge_index[1]]
-            edge_order = np.argsort(edge_weights)
-
-            for edge_idx in edge_order:
-                u, v = edge_index[:, edge_idx]
-                if o["in_mst"][i][u, v] == 1:
-                    continue
-                if not is_disjoint(u, v, o, i):
-                    continue
-
-                node_probs = np.zeros((len(o["last_selected_0"][i]),), dtype=np.float32)
-                node_probs[u] = 0.5
-                node_probs[v] = 0.5
-                return node_probs
-
-            raise ValueError("No valid node found for phase 1. Check the input data.")
-
-        max_nodes = unpad_array(obs["adj"][i]).shape[0]
-        if obs["phase"][i] == 0:  # phase 1
-            return phase_1_policy(obs, i, max_nodes)
-
-        elif obs["phase"][i] == 1:  # phase 2
-            neighbour = phase_2_policy(
-                obs, i, np.argmax(obs["last_selected_0"][i]), max_nodes
-            )
-            if neighbour is not None and neighbour.sum() > 0:
-                return neighbour
-            else:
-                raise ValueError("No valid neighbours found for phase 2.")
-
-        else:
-            raise ValueError("Invalid phase for action selection.")
-
-    @staticmethod
-    def _expert_policy_demonstrations(obs: dict[str, np.ndarray], i: int) -> np.ndarray:
-        probs = MSTKruskalEnv._expert_policy_probabilities(obs, i)
-        return np.array([np.random.choice(len(probs), p=probs)])
-
-    @staticmethod
-    def expert_policy(obs: dict[str, np.ndarray], *args, **kwargs) -> np.ndarray:
-        """Expert policy for the TSP environment.
-
-        Returns action demonstrations rather than probabilities.
-        """
-
-        to_unnest = False
-        if len(obs["last_selected_0"].shape) < 2:
-            to_unnest = True
-        for key, value in obs.items():
-            value = np.expand_dims(value, axis=0)
-
-        def single_policy(o, i):
-            method = kwargs.get("method", "probabilities")
-            if method == "probabilities":
-                return MSTKruskalEnv._expert_policy_probabilities(o, i)
-            elif method == "demonstrations":
-                return MSTKruskalEnv._expert_policy_demonstrations(o, i)
-
-        actions = np.array(
-            [single_policy(obs, i) for i in range(len(obs["last_selected_0"]))]
-        )
-        if to_unnest:
-            return actions.reshape(-1, len(actions[0]))
 
         return actions

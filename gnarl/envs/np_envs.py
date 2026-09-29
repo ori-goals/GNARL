@@ -32,6 +32,7 @@ class TSPEnv(PhasedNodeSelectEnv):
             num_phases=1,
             graph_generator=graph_generator,
         )
+        self.use_heuristic = kwargs.get("use_heuristic", False)
 
     def _init_observation_space(
         self,
@@ -89,10 +90,45 @@ class TSPEnv(PhasedNodeSelectEnv):
             )
         return done
 
+    def _heuristic_insertion(self, new_node: int) -> None:
+        # Insert the new node in the best position in the current tour
+        best_increase = np.inf
+        best_position = -1
+        nodes_in_tour = np.where(self.in_tour == 1)[0]
+        existing_tour_nodes = nodes_in_tour[nodes_in_tour != new_node]
+        if len(existing_tour_nodes) < 1:
+            return
+        if len(existing_tour_nodes) == 1:
+            prev_node = self.last_selected[0]
+            self.next_nodes[new_node] = self.next_nodes[prev_node]
+            self.next_nodes[prev_node] = new_node
+            return
+        for node in existing_tour_nodes:
+            next_node = self.next_nodes[node]
+            increase = (
+                self.weights[node, new_node].item()
+                + self.weights[new_node, next_node].item()
+                - self.weights[node, next_node].item()
+            )
+            if increase < best_increase:
+                best_increase = increase
+                best_position = node
+
+        if best_position != -1:
+            # Insert the new node in the best position
+            self.next_nodes[new_node] = self.next_nodes[best_position]
+            self.next_nodes[best_position] = new_node
+
     def _step_env(self, action: int) -> dict:
         new_node = action
+        prev_node = self.last_selected[0]
         self.in_tour[new_node] = 1
 
+        if self.use_heuristic:
+            self._heuristic_insertion(new_node)
+            return {}
+
+        # Add the node to the tour and close the loop
         prev_node = self.last_selected[0]
 
         if prev_node is not None:
@@ -115,20 +151,16 @@ class TSPEnv(PhasedNodeSelectEnv):
 
     def action_masks(self):
         if self.current_phase == 0:
+            # Can select any node not already in the tour
             if self.last_selected[0] is None:
                 return pad_to_max_nodes(self.graph_data.s.numpy(), self.max_nodes)
             return pad_to_max_nodes(self.in_tour == 0, self.max_nodes)
         else:
             raise ValueError("Invalid phase for action masks.")
 
-    def render(self, mode="human"):
-        print("Next nodes:")
-        print(self.next_nodes)
-        print("In tour:")
-        print(self.in_tour)
-
     @staticmethod
     def _expert_policy_strong(o: dict[str, np.ndarray], i) -> np.ndarray:
+        """Strong expert policy for the TSP environment using Concorde."""
         if np.all(o["last_selected_0"][i] == 0):
             return np.array([np.argmax(o["s"][i])])
 
@@ -147,6 +179,7 @@ class TSPEnv(PhasedNodeSelectEnv):
 
     @staticmethod
     def _expert_policy_greedy(o: dict[str, np.ndarray], i) -> np.ndarray:
+        """Greedy expert policy for the TSP environment."""
         if np.all(o["last_selected_0"][i] == 0):
             return np.array([np.argmax(o["s"][i])])
 
@@ -165,13 +198,15 @@ class TSPEnv(PhasedNodeSelectEnv):
         """Expert policy for the TSP environment.
 
         Returns action demonstrations rather than probabilities.
-        """
 
-        to_unnest = False
-        if len(obs["last_selected_0"].shape) < 2:
-            to_unnest = True
-        for key, value in obs.items():
-            value = np.expand_dims(value, axis=0)
+        Args:
+            obs (dict): The observation from the environment.
+            *args: Additional arguments.
+            **kwargs: Additional arguments, including:
+                method (str): The method to use for the expert policy. Options are "concorde" or "greedy".
+        Returns:
+            np.ndarray: The action chosen by the expert policy.
+        """
 
         def single_policy(o, i):
             if kwargs.get("method", "concorde") == "concorde":
@@ -182,8 +217,6 @@ class TSPEnv(PhasedNodeSelectEnv):
         actions = np.array(
             [single_policy(obs, i) for i in range(len(obs["last_selected_0"]))]
         )
-        if to_unnest:
-            return actions.reshape(-1, len(actions[0]))
 
         return actions
 
@@ -204,7 +237,7 @@ class TSPEnv(PhasedNodeSelectEnv):
 
 class MVCEnv(PhasedNodeSelectEnv):
     """
-    A custom Gymnasium environment for simulating the Minimum Vertex Cover problem.
+    A custom Gymnasium environment for simulating the weighted Minimum Vertex Cover problem.
     """
 
     def __init__(
@@ -217,7 +250,6 @@ class MVCEnv(PhasedNodeSelectEnv):
             max_nodes=max_nodes,
             num_phases=1,
             graph_generator=graph_generator,
-            observe_final_selection=False,
         )
 
     def _init_observation_space(
@@ -225,25 +257,6 @@ class MVCEnv(PhasedNodeSelectEnv):
     ) -> tuple[gym.spaces.Dict, dict[str, tuple[str, str, str]]]:
         obs_space = spaces.Dict(
             {
-                # state
-                "cover_weight": spaces.Box(
-                    low=0,
-                    high=np.inf,
-                    shape=(1,),
-                    dtype=np.float32,
-                ),
-                "covered_proportion": spaces.Box(
-                    low=0,
-                    high=1,
-                    shape=(1,),
-                    dtype=np.float32,
-                ),
-                "covered_edges": spaces.Box(
-                    low=0,
-                    high=1,
-                    shape=(self.max_nodes, self.max_nodes),
-                    dtype=np.int32,
-                ),
                 # outputs
                 "in_cover": spaces.Box(
                     low=0,
@@ -255,9 +268,6 @@ class MVCEnv(PhasedNodeSelectEnv):
         )
         spec = {
             "in_cover": ("state", "node", "mask"),
-            "cover_weight": ("state", "graph", "scalar"),
-            "covered_proportion": ("state", "graph", "scalar"),
-            "covered_edges": ("state", "edge", "mask"),
         }
         return obs_space, spec
 
@@ -269,23 +279,8 @@ class MVCEnv(PhasedNodeSelectEnv):
         return edge_mask
 
     def _get_observation(self) -> dict:
-        covered_edges = th.Tensor(self._get_covered_edges())
         return {
             "in_cover": pad_to_max_nodes(self.in_cover, self.max_nodes),
-            "cover_weight": np.array(
-                [np.sum(self.in_cover * self.graph_data.nw.numpy())], dtype=np.float32
-            ),
-            "covered_proportion": np.array(
-                [covered_edges.mean()],
-                dtype=np.float32,
-            ),
-            "covered_edges": to_dense_adj(
-                self.graph_data.edge_index,
-                max_num_nodes=self.graph_data.num_nodes,
-                edge_attr=covered_edges,
-            )
-            .numpy()[0]
-            .astype(np.int32),
         }
 
     def _reset_state(self, seed=None, options=None):
@@ -308,11 +303,8 @@ class MVCEnv(PhasedNodeSelectEnv):
         return -sum(kwargs["in_cover"] * kwargs["nw"])
 
     def action_masks(self):
+        # Can select any node not already in the cover
         return pad_to_max_nodes(self.in_cover == 0, self.max_nodes)
-
-    def render(self, mode="human"):
-        print("In cover:")
-        print(self.in_cover)
 
     @staticmethod
     def _expert_policy_probabilities(
@@ -337,25 +329,8 @@ class MVCEnv(PhasedNodeSelectEnv):
         if to_select.sum() == 0:
             raise ValueError("No valid nodes to select for the vertex cover.")
 
-        weighting = kwargs.get("weighting", "uniform")
-        if weighting == "uniform":
-            node_probs = np.zeros_like(o["nw"][i], dtype=np.float32)
-            node_probs[: to_select.shape[0]] = to_select
-        elif weighting == "node_weights":
-            node_weights = o["nw"][i][:max_nodes] * to_select
-            node_probs = 1 - node_weights
-            node_probs[to_select == 0] = 0
-        elif weighting == "degree":
-            degrees = o["adj"][i][:max_nodes].sum(axis=1) * to_select
-            node_probs = degrees.astype(np.float32)
-        elif weighting == "weighted_degree":
-            degrees = o["adj"][i][:max_nodes].sum(axis=1) * to_select
-            node_weights = o["nw"][i][:max_nodes]
-            inverse_weights = (1 - node_weights) * to_select
-            node_probs = degrees * inverse_weights
-        else:
-            raise ValueError(f"Unknown weighting method: {weighting}")
-
+        node_probs = np.zeros_like(o["nw"][i], dtype=np.float32)
+        node_probs[: to_select.shape[0]] = to_select
         node_probs /= node_probs.sum()
         return node_probs
 
@@ -364,13 +339,22 @@ class MVCEnv(PhasedNodeSelectEnv):
         obs: dict[str, np.ndarray], i: int, **kwargs
     ) -> np.ndarray:
         probs = MVCEnv._expert_policy_probabilities(obs, i, **kwargs)
-        if kwargs.get("sampling", "stochastic") == "greedy":
-            return np.array([np.argmax(probs)])
         return np.array([np.random.choice(len(probs), p=probs)])
 
     @staticmethod
     def expert_policy(obs: dict[str, np.ndarray], *args, **kwargs) -> np.ndarray:
-        """Expert policy for the MVC environment."""
+        """Expert policy for the MVC environment.
+
+        Returns action demonstrations rather than probabilities.
+
+        Args:
+            obs (dict): The observation from the environment.
+            *args: Additional arguments.
+            **kwargs: Additional arguments, including:
+                method (str): The method to use for the expert policy. Options are "exact" or "approx".
+        Returns:
+            np.ndarray: The action chosen by the expert policy.
+        """
 
         def single_policy(o, i):
             method = kwargs.get("method", "probabilities")
@@ -392,7 +376,17 @@ class MVCEnv(PhasedNodeSelectEnv):
         return data
 
 
-class RobustConstructionEnv(PhasedNodeSelectEnv):
+class RGCEnv(PhasedNodeSelectEnv):
+    """
+    A custom Gymnasium environment for simulating the Robust Graph Construction problem.
+
+    The environment allows for the addition of edges to a graph with the goal of maximizing robustness.
+
+    Options for the objective function include:
+    - "random": Uses the CriticalFractionRandom objective function.
+    - "targeted": Uses the CriticalFractionTargeted objective function.
+    """
+
     def __init__(
         self,
         max_nodes: int,
@@ -416,6 +410,7 @@ class RobustConstructionEnv(PhasedNodeSelectEnv):
     def _init_observation_space(
         self,
     ) -> tuple[gym.spaces.Dict, dict[str, tuple[str, str, str]]]:
+        # NOTE: overrides the `adj` variable normally provided by the base class
         obs_space = spaces.Dict(
             {
                 # outputs
@@ -458,7 +453,6 @@ class RobustConstructionEnv(PhasedNodeSelectEnv):
         # Initialise state variables
         self.adj = to_dense_adj(
             self.graph_data.edge_index,
-            edge_attr=self.graph_data.initial_edges,
             max_num_nodes=self.max_nodes,
         ).numpy()[0]
         max_edges = (self.num_nodes * (self.num_nodes - 1)) / 2
@@ -473,17 +467,13 @@ class RobustConstructionEnv(PhasedNodeSelectEnv):
 
     def is_terminal(self) -> bool:
         done = self.remaining_budget <= 0
-        if done:
-            assert (
-                self.adj.sum() / 2 - self.graph_data.initial_edges.sum() / 2
-                == self.start_budget
-            )
         return done
 
     def _step_env(self, action: int) -> dict:
         if self.current_phase != 1:
             return {}
 
+        # Add the edge to the graph
         u = self.last_selected[0]
         v = action
         self.adj[u, v] = 1
@@ -522,11 +512,18 @@ class RobustConstructionEnv(PhasedNodeSelectEnv):
             raise ValueError(f"Unknown objective method: {kwargs.get('objective')}")
 
     def objective_function(self, **kwargs) -> float:
-        return RobustConstructionEnv._objective_function(
-            objective=self.objective_method, **kwargs
-        )
+        """Calculate the objective function for the Robust Graph Construction environment.
+        Args:
+            **kwargs: Additional arguments, including:
+                adj (np.ndarray): The adjacency matrix of the graph.
+                objective (str): The objective function to use. Options are "random" or "targeted".
+        Returns:
+            float: The value of the objective function.
+        """
+        return RGCEnv._objective_function(objective=self.objective_method, **kwargs)
 
     def action_masks(self):
+        # Can select any edge that does not yet exist
         available_edges = self._calculate_reminaining_edges()
         if self.current_phase == 0:
             node_mask = (available_edges.sum(axis=1) > 0).astype(np.int32)
@@ -537,19 +534,9 @@ class RobustConstructionEnv(PhasedNodeSelectEnv):
             )
         raise ValueError("Invalid phase for action masks.")
 
-    def render(self, mode="human"):
-        print("In graph:")
-        print(self.adj)
-        print(f"Remaining budget: {self.remaining_budget}")
-
     @staticmethod
     def _greedy_expert_policy(obs: dict[str, np.ndarray], **kwargs) -> np.ndarray:
         """Greedy expert policy for the Robust Construction environment."""
-        to_unnest = False
-        if len(obs["last_selected_0"].shape) < 2:
-            to_unnest = True
-        for key, value in obs.items():
-            value = np.expand_dims(value, axis=0)
 
         def phase_1_policy(o, i):
             edge_improvement = np.zeros_like(o["adj"][i], dtype=np.float32)
@@ -561,12 +548,10 @@ class RobustConstructionEnv(PhasedNodeSelectEnv):
                         new_adj = o["adj"][i].copy()
                         new_adj[j, k] = 1
                         new_adj[k, j] = 1
-                        edge_improvement[j, k] = (
-                            RobustConstructionEnv._objective_function(
-                                adj=new_adj,
-                                objective=kwargs.get("objective", "random"),
-                                random_seed=41,  # different
-                            )
+                        edge_improvement[j, k] = RGCEnv._objective_function(
+                            adj=new_adj,
+                            objective=kwargs.get("objective", "random"),
+                            random_seed=41,  # different
                         )
             edge_id = np.argmax(edge_improvement)
             next_node = np.unravel_index(edge_id, edge_improvement.shape)[0]
@@ -584,7 +569,7 @@ class RobustConstructionEnv(PhasedNodeSelectEnv):
                     new_adj = o["adj"][i].copy()
                     new_adj[j, k] = 1
                     new_adj[k, j] = 1
-                    edge_improvement[k] = RobustConstructionEnv._objective_function(
+                    edge_improvement[k] = RGCEnv._objective_function(
                         adj=new_adj,
                         objective=kwargs.get("objective", "random"),
                         random_seed=41,  # different
@@ -605,20 +590,22 @@ class RobustConstructionEnv(PhasedNodeSelectEnv):
         actions = np.array(
             [single_policy(obs, i) for i in range(len(obs["last_selected_0"]))]
         )
-        if to_unnest:
-            return actions.reshape(-1, len(actions[0]))
 
         return actions
 
     @staticmethod
     def expert_policy(obs: dict[str, np.ndarray], *args, **kwargs) -> np.ndarray:
         if kwargs.get("method") == "greedy":
-            return RobustConstructionEnv._greedy_expert_policy(obs, **kwargs)
+            return RGCEnv._greedy_expert_policy(obs, **kwargs)
+        else:
+            raise ValueError(
+                f"Unknown expert policy method: {kwargs.get('method')}. Supported methods are 'greedy'."
+            )
 
     @staticmethod
     def pre_transform(data: GraphProblemData) -> GraphProblemData:
-        """Add the expert policy value to the data."""
-        current_graph_state = data.initial_edges
+        """Add the initial objective function values to the graph data."""
+        current_graph_state = to_dense_adj(data.edge_index)[0].numpy()
         uni_edges = np.triu(current_graph_state, k=1)
         edge_index = np.where(uni_edges == 1)
         edge_pairs = np.stack(edge_index, axis=-1)

@@ -197,22 +197,6 @@ class BellmanFordSampler(Sampler):
         return graph_data
 
 
-class MSTKruskalSampler(Sampler):
-    """Kruskal's algorithm sampler."""
-
-    def _sample_data(self, low=0.0, high=1.0):
-        graph_data = self._create_graph(
-            self._num_nodes,
-            directed=False,
-            acyclic=False,
-            weighted=True,
-            low=low,
-            high=high,
-            **self._graph_generator_kwargs,
-        )
-        return graph_data
-
-
 class TspSampler(Sampler):
     """TSP sampler for travelling salesperson problem."""
 
@@ -298,8 +282,7 @@ SAMPLERS = {
     "bfs": BfsSampler,
     "bellman_ford": BellmanFordSampler,
     "mst_prim": BellmanFordSampler,
-    "mst_kruskal": MSTKruskalSampler,
     "tsp": TspSampler,
     "mvc": MVCSampler,
-    "robust_construction": RobustConstructionSampler,
+    "rgc": RobustConstructionSampler,
 }
